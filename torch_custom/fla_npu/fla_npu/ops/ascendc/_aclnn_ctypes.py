@@ -21,6 +21,7 @@ from __future__ import annotations
 import ctypes
 import sys
 
+from ._chunk_scaled_dot_kkt_contract import validate as _validate_chunk_scaled_dot_kkt
 from ._kda_policy import (
     kda_fwd_optional_output_mask,
     _select_kda_bwd_optimized,
@@ -2121,22 +2122,29 @@ def npu_chunk_scaled_dot_kkt(
 ):
     import torch
 
+    B, Hv, T = _validate_chunk_scaled_dot_kkt(k, g, beta, cu_seqlens, chunk_indices, chunk_size)
     k_contig = k.contiguous()
     g_contig = g.contiguous()
     beta_contig = beta.contiguous()
-    B, _, T, _ = _shape(k_contig)
-    _, Hv, _ = _shape(g_contig)
     out = _empty((B, Hv, T, int(chunk_size)), k_contig, dtype=torch.float32)
+
+    def nd_tensor(ctx, tensor, name):
+        return ctx.tensor(
+            tensor, name,
+            acl_format_override=ACL_FORMAT_ND,
+            storage_shape_override=_shape(tensor),
+        )
+
     return _call_aclnn(
         "aclnnChunkScaledDotKkt",
         lambda ctx: [
-            ctx.tensor(k_contig, "k"),
-            ctx.tensor(g_contig, "g"),
-            ctx.tensor(beta_contig, "beta"),
+            nd_tensor(ctx, k_contig, "k"),
+            nd_tensor(ctx, g_contig, "g"),
+            nd_tensor(ctx, beta_contig, "beta"),
             ctx.int_array(cu_seqlens),
             ctx.int_array(chunk_indices),
             ctypes.c_int64(int(chunk_size)),
-            ctx.tensor(out, "out"),
+            nd_tensor(ctx, out, "out"),
         ],
         out,
     )
