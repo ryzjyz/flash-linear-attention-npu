@@ -22,6 +22,8 @@ STABLE_ABI_MIN_TORCH = "2.7.1"
 
 sys.path.insert(0, str(REPO_ROOT / "scripts"))
 
+from fla_npu_artifacts import get_wheel_dist_name  # noqa: E402
+
 
 def _resolve_output_dir(value: str) -> Path:
     output_dir = Path(value).expanduser()
@@ -274,9 +276,11 @@ def main() -> int:
         env["FLA_NPU_BUILD_ARGS"] = build_args
     subprocess.run(command, cwd=REPO_ROOT, check=True, env=env)
 
-    # The wheel is tagged for the host platform and the build tag carries the
-    # SoC, so resolve the actual file instead of predicting the name.
-    wheel_files = sorted(wheel_dir.glob("flash_linear_attention_npu-*.whl"))
+    # The wheel is tagged for the host platform and (outside PyPI mode) the
+    # build tag carries the SoC, so resolve the actual file instead of
+    # predicting the full name -- but the distribution name is decided by the
+    # build mode (tiered PyPI name vs. the base name), so filter on it.
+    wheel_files = sorted(wheel_dir.glob(f"{get_wheel_dist_name()}-*.whl"))
     if not wheel_files:
         raise RuntimeError(f"Expected wheel was not produced under {wheel_dir}")
     wheel_path = wheel_files[-1]
