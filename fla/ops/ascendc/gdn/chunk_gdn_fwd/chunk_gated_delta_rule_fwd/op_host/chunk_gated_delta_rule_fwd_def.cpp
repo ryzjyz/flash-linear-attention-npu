@@ -59,6 +59,8 @@ public:
         // low-level input, while 1 is the explicit BTH candidate route.
         // Optional preserves existing low-level callers and defaults to BHT.
         this->Attr("raw_g_layout").AttrType(OPTIONAL).Int(0);
+        this->Attr("qkv_layout").AttrType(OPTIONAL).Int(0);
+        this->Attr("o_layout").AttrType(OPTIONAL).Int(0);
 
         OpAICoreConfig config;
         config.DynamicCompileStaticFlag(true)

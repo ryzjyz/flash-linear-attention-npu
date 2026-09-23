@@ -9,6 +9,7 @@
 
 #define CATLASS_ARCH 2201
 
+#include "../../../../../qkv_input_layout.h"
 #include "catlass/arch/arch.hpp"
 #include "catlass/arch/cross_core_sync.hpp"
 #include "catlass/arch/resource.hpp"
@@ -132,6 +133,12 @@ public:
 
 
     uint32_t batch;
+    bool inputSequenceMajor{false};
+    __aicore__ inline void ConfigureInputLayout(bool sequenceMajor) { inputSequenceMajor = sequenceMajor; }
+    __aicore__ inline uint64_t RawQkOffset(uint64_t offset) const
+    {
+        return inputSequenceMajor ? GDN::QkvSequenceMajorOffset(offset, seqlen, kNumHead, kHeadDim) : offset;
+    }
     uint32_t seqlen;
     uint32_t kNumHead;
     uint32_t vNumHead;
@@ -508,7 +515,7 @@ public:
                 } else {
                     weight = LoadScalarAsFloat(
                         gmK,
-                        offsets.wkOffset + tokenRow * kHeadDim + kRow);
+                        RawQkOffset(offsets.wkOffset + static_cast<uint64_t>(tokenRow) * kHeadDim + kRow));
                 }
                 AscendC::Muls(floatUb, floatUb, weight, offsets.vBlockDim);
                 AscendC::PipeBarrier<PIPE_V>();
@@ -600,7 +607,10 @@ public:
             auto hLayout = tla::MakeLayout<ElementH, LayoutH>(shapeBatch * vNumHead * cubeBlockScheduler.totalChunks * kHeadDim, vHeadDim);
             auto vLayout = tla::MakeLayout<ElementVWork, LayoutV>(coreNum * chunkSize * PING_PONG_STAGES, cubeBlockScheduler.vBlockSize);
 
-            auto kLayout = tla::MakeLayout<ElementK, LayoutK>(kHeadDim, shapeBatch * kNumHead * cubeBlockScheduler.totalTokens);
+            const int64_t kStride = static_cast<int64_t>(kHeadDim) *
+                (inputSequenceMajor && !kGated ? kNumHead : 1);
+            auto kLayout = tla::MakeLayoutFromTag(
+                LayoutK(kHeadDim, shapeBatch * kNumHead * cubeBlockScheduler.totalTokens, kStride));
             auto vworkLayout = tla::MakeLayout<ElementV, LayoutV>(coreNum * chunkSize * PING_PONG_STAGES, cubeBlockScheduler.vBlockSize);
             auto hworkLayout = tla::MakeLayout<ElementHWork, LayoutH>(coreNum * kHeadDim * PING_PONG_STAGES, cubeBlockScheduler.vBlockSize);
             uint32_t taskWaveCount = cubeBlockScheduler.GetTaskWaveCount();
@@ -678,7 +688,7 @@ public:
                             int64_t cube2OffsetH = cube2Offsets.hWorkOffset;
                             auto tensorK = kGated
                                 ? tla::MakeTensor(gmKDecayWorkspace[cube2OffsetKwork], kLayout, Catlass::Arch::PositionGM{})
-                                : tla::MakeTensor(gmK[cube2OffsetKwork], kLayout, Catlass::Arch::PositionGM{});
+                                : tla::MakeTensor(gmK[RawQkOffset(cube2OffsetKwork)], kLayout, Catlass::Arch::PositionGM{});
                             auto tensorVwork = tla::MakeTensor(gmVUpdateWorkspace[cube2OffsetVwork], vworkLayout, Catlass::Arch::PositionGM{});
                             auto tensorHwork = tla::MakeTensor(gmHWorkspace[cube2OffsetH], hworkLayout, Catlass::Arch::PositionGM{});
                             GemmCoord cube2Shape{kHeadDim, cube2Offsets.vBlockDim, cube2Offsets.blockTokens};

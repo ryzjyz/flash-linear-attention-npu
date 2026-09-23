@@ -92,6 +92,14 @@ static bool IsAscend950()
     return IsRegbase(npuArch);
 }
 
+static bool IsDav2201CandidateSoc();
+
+static bool IsNativeQkvLayout(const ChunkGatedDeltaRuleFwdParams &params)
+{
+    return IsDav2201CandidateSoc() && params.layout != nullptr &&
+           (std::strcmp(params.layout, "BSND") == 0 || std::strcmp(params.layout, "TND") == 0);
+}
+
 static bool UsePreparePath(const ChunkGatedDeltaRuleFwdParams &params)
 {
     if (IsAscend950()) {
@@ -115,11 +123,12 @@ static bool UsePreparePath(const ChunkGatedDeltaRuleFwdParams &params)
     }
     const bool legacyLayout = std::strcmp(params.layout, "BNSD") == 0 ||
                               std::strcmp(params.layout, "NTD") == 0;
-    // Keep the non-Ascend950 legacy selection unchanged.
+    // A2 reads token-major QKV directly; feature selection is otherwise unchanged.
     return params.useExp2 || params.useQkL2norm ||
            params.aLogOptional != nullptr || params.dtBiasOptional != nullptr ||
            params.betaEffOutOptional != nullptr || params.allowNegEigval ||
-           params.hOutOptional != nullptr || params.stateVFirst || !legacyLayout;
+           params.hOutOptional != nullptr || params.stateVFirst ||
+           (!legacyLayout && !IsNativeQkvLayout(params));
 }
 
 static op::Shape MakeShape(std::initializer_list<int64_t> dims)
@@ -134,6 +143,18 @@ static op::Shape MakeShape(std::initializer_list<int64_t> dims)
 static const aclIntArray *MakePerm(std::initializer_list<int64_t> dims, aclOpExecutor *executor)
 {
     return executor->AllocIntArray(dims.begin(), dims.size());
+}
+
+static const aclTensor *DenseQkvView(const aclTensor *tensor, aclOpExecutor *executor)
+{
+    // MakeContiguous has already materialized noncontiguous inputs. This is metadata only.
+    // Preserve a contiguous caller view's storage offset without mutating its descriptor.
+    auto *view = executor->CreateView(tensor, tensor->GetViewShape(), tensor->GetViewOffset());
+    if (view != nullptr) {
+        view->SetStorageShape(tensor->GetViewShape());
+        view->SetOriginalShape(tensor->GetViewShape());
+    }
+    return view;
 }
 
 static const aclTensor *TransposeContiguous(const aclTensor *tensor, std::initializer_list<int64_t> dims,
@@ -398,8 +419,9 @@ static aclnnStatus CheckSupportedL2Contract(const ChunkGatedDeltaRuleFwdParams &
                    "Q/K L2Norm outputs must be omitted when useQkL2norm is false.");
         return ACLNN_SUCCESS;
     }
-    CHECK_COND(std::strcmp(params.layout, "BNSD") == 0 || std::strcmp(params.layout, "NTD") == 0,
-               ACLNN_ERR_PARAM_INVALID, "The Phase 6 implementation supports BNSD and NTD only.");
+    CHECK_COND(std::strcmp(params.layout, "BNSD") == 0 || std::strcmp(params.layout, "NTD") == 0 ||
+                   IsNativeQkvLayout(params),
+               ACLNN_ERR_PARAM_INVALID, "This device does not support the requested QKV layout.");
     CHECK_COND(params.qHatOutOptional == nullptr && params.kHatOutOptional == nullptr &&
                    params.qRstdOutOptional == nullptr && params.kRstdOutOptional == nullptr,
                ACLNN_ERR_PARAM_INVALID,
@@ -808,19 +830,29 @@ static aclnnStatus ChunkGatedDeltaRuleFwdGetWorkspaceSizeImpl(
                         gCumsumCompute != nullptr && aCompute != nullptr,
                     169101);
 
-    const aclTensor *oHead = executorPtr->AllocTensor(
-        MakeShape({batch, hv, seqlen, vDim}), params.q->GetDataType(), Format::FORMAT_ND);
-    GDN_STAGE_CHECK(oHead != nullptr, 169109);
+    const bool sequenceMajorOutput = IsDav2201CandidateSoc();
+    const aclTensor *oCompute = executorPtr->AllocTensor(
+        sequenceMajorOutput ? MakeShape({batch, seqlen, hv, vDim}) : MakeShape({batch, hv, seqlen, vDim}),
+        params.q->GetDataType(), Format::FORMAT_ND);
+    GDN_STAGE_CHECK(oCompute != nullptr, 169109);
+    const bool nativeQkv = IsNativeQkvLayout(params);
+    const aclTensor *qInput = nativeQkv ? DenseQkvView(params.q, executorPtr) : params.q;
+    const aclTensor *kInput = nativeQkv ? DenseQkvView(params.k, executorPtr) : params.k;
+    const aclTensor *vInput = nativeQkv ? DenseQkvView(params.v, executorPtr) : params.v;
+    GDN_STAGE_CHECK(qInput != nullptr && kInput != nullptr && vInput != nullptr, 169113);
     auto phase6Result = l0op::ChunkGatedDeltaRuleFwd(
-        params.q, params.k, params.v, betaBht, aStorageBhtc, gRaw, nullptr,
+        qInput, kInput, vInput, betaBht, aStorageBhtc, gRaw, nullptr,
         params.initialStateOptional, params.cuSeqlensOptional, params.chunkIndicesOptional,
         outputFinalState, params.chunkSize, params.scale, params.gCumsumOutOptional != nullptr,
-        oHead, finalState,
-        gCumsumCompute, aCompute, usePreparedCumsum ? 1 : 0, executorPtr);
+        oCompute, finalState,
+        gCumsumCompute, aCompute, usePreparedCumsum ? 1 : 0, nativeQkv ? 1 : 0,
+        sequenceMajorOutput ? 1 : 0, executorPtr);
     GDN_STAGE_CHECK(phase6Result[0] != nullptr && phase6Result[2] != nullptr &&
                         phase6Result[3] != nullptr,
                         169112);
-    const aclTensor *oSequence = TransposeContiguous(oHead, {0, 2, 1, 3}, executorPtr);
+    // ViewCopy binds a dense output or materializes the caller's strided view.
+    const aclTensor *oSequence = sequenceMajorOutput ? oCompute :
+        TransposeContiguous(oCompute, {0, 2, 1, 3}, executorPtr);
     GDN_STAGE_CHECK(oSequence != nullptr && l0op::ViewCopy(oSequence, params.oOut, executorPtr) != nullptr,
                     169107);
 
