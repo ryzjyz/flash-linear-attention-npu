@@ -16,6 +16,7 @@
 #ifndef RECOMPUTE_W_U_FWD_VECTOR_H
 #define RECOMPUTE_W_U_FWD_VECTOR_H
 
+#include "../../../qkv_input_layout.h"
 #include "recompute_w_u_fwd_struct.h"
 #include "catlass/arch/cross_core_sync.hpp"
 using namespace AscendC;
@@ -26,6 +27,9 @@ template <typename kType, typename betaType, bool kFlattenHeadTasks = false,
           bool kAbcTaskOrder = false>
 class RecomputeWUFwdVectorProcess {
 public:
+    bool inputSequenceMajor{false};
+    __aicore__ inline void ConfigureInputLayout(bool sequenceMajor) { inputSequenceMajor = sequenceMajor; }
+
     /** @brief constructor */
     __aicore__ inline RecomputeWUFwdVectorProcess(GM_ADDR k_, GM_ADDR v_, GM_ADDR beta_, GM_ADDR A_, GM_ADDR g_, GM_ADDR cu_seqlens_,
                                                         GM_ADDR chunk_indices_, GM_ADDR w_, GM_ADDR u_,
@@ -208,7 +212,23 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                     auto tensorVin = vInQue.AllocTensor<kType>();
                     auto tensorBetain = betaInQue.AllocTensor<betaType>();
 
-                    DataCopy(tensorVin, vTensor[vOffset], V * curRowNum);
+                    if (inputSequenceMajor) {
+                        const uint64_t inputOffset = GDN::QkvSequenceMajorOffset(vOffset, T, Hv, V);
+                        const uint64_t rowGap = static_cast<uint64_t>(Hv - 1) * V * sizeof(kType);
+                        if (rowGap <= 0xffffffffULL) {
+                            DataCopyPad(tensorVin, vTensor[inputOffset],
+                                {static_cast<uint16_t>(curRowNum), static_cast<uint32_t>(V * sizeof(kType)),
+                                 static_cast<uint32_t>(rowGap), 0, 0}, {false, 0, 0, 0});
+                        } else {
+                            // The DMA gap field is uint32 bytes; large strides remain correct.
+                            for (uint32_t row = 0; row < curRowNum; ++row) {
+                                DataCopy(tensorVin[row * V],
+                                    vTensor[inputOffset + static_cast<uint64_t>(row) * Hv * V], V);
+                            }
+                        }
+                    } else {
+                        DataCopy(tensorVin, vTensor[vOffset], V * curRowNum);
+                    }
                     DataCopyPad(tensorBetain, betaTensor[betaOffset], {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},{false, 0, 0, 0});
 
                     vInQue.EnQue(tensorVin);
@@ -339,7 +359,23 @@ __aicore__ void inline RecomputeWUFwdVectorProcess<kType, betaType,
                     auto tensorKin = kInQue.AllocTensor<kType>();
                     auto tensorBetain = betaInQue.AllocTensor<betaType>();
                     auto tensorGin = gInQue.AllocTensor<betaType>();
-                    DataCopy(tensorKin, kTensor[kSrcOffset], K * curRowNum);
+                    if (inputSequenceMajor) {
+                        const uint64_t inputOffset = GDN::QkvSequenceMajorOffset(kSrcOffset, T, Hk, K);
+                        const uint64_t rowGap = static_cast<uint64_t>(Hk - 1) * K * sizeof(kType);
+                        if (rowGap <= 0xffffffffULL) {
+                            DataCopyPad(tensorKin, kTensor[inputOffset],
+                                {static_cast<uint16_t>(curRowNum), static_cast<uint32_t>(K * sizeof(kType)),
+                                 static_cast<uint32_t>(rowGap), 0, 0}, {false, 0, 0, 0});
+                        } else {
+                            // The DMA gap field is uint32 bytes; large strides remain correct.
+                            for (uint32_t row = 0; row < curRowNum; ++row) {
+                                DataCopy(tensorKin[row * K],
+                                    kTensor[inputOffset + static_cast<uint64_t>(row) * Hk * K], K);
+                            }
+                        }
+                    } else {
+                        DataCopy(tensorKin, kTensor[kSrcOffset], K * curRowNum);
+                    }
                     DataCopyPad(tensorBetain, betaTensor[betaOffset], {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},{false, 0, 0, 0});
                     DataCopyPad(tensorGin, gTensor[betaOffset], {1, curRowNum * static_cast<uint32_t>(sizeof(betaType)), 0, 0, 0},{false, 0, 0, 0});
                     kInQue.EnQue(tensorKin);

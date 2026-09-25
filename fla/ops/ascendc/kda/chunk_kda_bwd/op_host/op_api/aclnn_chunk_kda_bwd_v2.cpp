@@ -140,13 +140,12 @@ extern "C" aclnnStatus aclnnChunkKdaBwdV2GetWorkspaceSize(
         }
         CHECK_COND(indices->Size() == static_cast<size_t>(2*nc), ACLNN_ERR_PARAM_INVALID, "Extra chunk indices.");
     }
-    const auto state = packed ? MakeShape({H,nc,128,128}) : MakeShape({B,H,nc,128,128});
-    const auto savedHShape = packed ? MakeShape({nc,H,128,128}) : MakeShape({B,nc,H,128,128});
+    const auto stateShape = packed ? MakeShape({nc,H,128,128}) : MakeShape({B,nc,H,128,128});
     if (disableRecompute) {
         for (const auto *x : {w,qg,kg,vNew}) {
             CHECK_COND(MatchesTensor(x,token,DataType::DT_BF16), ACLNN_ERR_PARAM_INVALID, "Saved token cache is invalid.");
         }
-        CHECK_COND(MatchesTensor(h,savedHShape,DataType::DT_BF16) && MatchesTensor(gk,token,DataType::DT_FLOAT),
+        CHECK_COND(MatchesTensor(h,stateShape,DataType::DT_BF16) && MatchesTensor(gk,token,DataType::DT_FLOAT),
             ACLNN_ERR_PARAM_INVALID, "Expected forward chunk-major h and FP32 gk caches.");
     } else {
         CHECK_COND(!w && !qg && !kg && !vNew && !h && !gk, ACLNN_ERR_PARAM_INVALID,
@@ -177,7 +176,7 @@ extern "C" aclnnStatus aclnnChunkKdaBwdV2GetWorkspaceSize(
         qg = AllocTensor(ex, token, DataType::DT_BF16);
         kg = AllocTensor(ex, token, DataType::DT_BF16);
         vNew = AllocTensor(ex, token, DataType::DT_BF16);
-        h = AllocTensor(ex, savedHShape, DataType::DT_BF16);
+        h = AllocTensor(ex, stateShape, DataType::DT_BF16);
         gk = AllocTensor(ex, token, DataType::DT_FLOAT);
         const auto *u = AllocTensor(ex, token, DataType::DT_BF16);
         CHECK_RET(w && qg && kg && vNew && h && gk && u, ACLNN_ERR_INNER_NULLPTR);
@@ -204,16 +203,14 @@ extern "C" aclnnStatus aclnnChunkKdaBwdV2GetWorkspaceSize(
         }
         const auto forwardResult = l0op::ChunkFwdH(
             kg4, w4, u4, nullptr, gk4, nullptr, cu, indices,
-            false, 64, true, true, false, true, h5, vNew4, nullptr, ex);
+            false, 64, true, true, false, h5, vNew4, nullptr, ex);
         // finalStateOut is intentionally absent; only h and v_new are required.
         CHECK_RET(forwardResult[0] && forwardResult[1], ACLNN_ERR_INNER_NULLPTR);
-        // h_chunk_major=true：FwdH 直接产出 chunk-major h（与 saved 模式供给的布局一致），
-        // Prepare/Finalize 按 chunk-major 契约读取，链上不再需要 host Transpose。
     }
     const auto *dAqk=AllocTensor(ex,matrix,DataType::DT_FLOAT);
     const auto *dv0=AllocTensor(ex,token,DataType::DT_BF16);
     const auto *dqRaw=AllocTensor(ex,token,DataType::DT_FLOAT);
-    const auto *dh=AllocTensor(ex,state,DataType::DT_BF16);
+    const auto *dh=AllocTensor(ex,stateShape,DataType::DT_BF16);
     const auto *dvScan=AllocTensor(ex,token,DataType::DT_BF16);
     CHECK_RET(dAqk && dv0 && dqRaw && dh && dvScan,ACLNN_ERR_INNER_NULLPTR);
     const auto prepareResult = l0op::ChunkKdaBwdPrepare(

@@ -102,6 +102,11 @@ AIV 用 FP32 算术执行 `R_next=decay*R+D`，按 StateT 保存 BF16 或 FP32 r
 
 ## 5. 存储布局
 
+历史 H 使用 chunk-major：dense `[B,C,HV,K,V]`，公开 packed `[1,total_chunks,HV,K,V]`。
+矩阵基址为 `((b*C+c)*HV+hv)*K*V`，packed 为 `(global_chunk*HV+hv)*K*V`；
+`state_v_first` 继续只控制矩阵内部 K/V 顺序。A2/A3/A5 的 Cube/Vector 共用
+`FwdHHOffset`，初始写出、下块写出和读取同时切换，状态递推计算顺序不变。
+
 AIC L1 固定分区：W `[0,64) KiB`，保留空洞 `[64,128) KiB`，H/right `[128,256) KiB`，
 kg `[256,320) KiB`。kg 区最多四个 16 KiB slot；每个 round 只占用 `requiredKhCount` 个。
 
@@ -207,7 +212,6 @@ head round 的展开数组。kernel 在进入 chunk 循环前，按 `kNumHead/vN
 | `vUpdateWorkspaceOffset` | Stage1 BF16 right 的 GM workspace，形状为 `[blockDim,4,64,128]` |
 | `kDecayWorkspaceOffset` | FP32 rolling state 的 GM workspace，形状为 `[blockDim,4,128,128]`；A5 使用每 AIV 两份常驻 state，不访问该段 |
 | `hWorkspaceOffset` | A2/A3 D 的 FP32 GM scratch，形状为 `[blockDim,4,128,128]` |
-| `hChunkMajor` | h 的 tile 级布局选择：0=head-major `[B,HV,C,K,V]`（公开契约，默认）；1=chunk-major `[B,C,HV,K,V]`，仅供算子组合内部调用方消除下游 host 转置。同一 (chunk, head) 的 `[K,V]` tile 在两种布局下均物理连续，kernel 只切换 `FwdHHOffset` 的 tile 基址公式，tile 内寻址与写回粒度不变 |
 
 workspace 的 core 维使用实际 `blockDim`，各段按 512 Byte 对齐，并在 CANN lib-api workspace
 之后额外保留运行时安全区。
