@@ -154,7 +154,6 @@ struct FwdHRuntimeTiling {
     bool useInitialState = false;
     bool storeFinalState = false;
     bool isVariedLen = false;
-    bool hChunkMajor = false;
 };
 
 struct FwdHKernelArgs {

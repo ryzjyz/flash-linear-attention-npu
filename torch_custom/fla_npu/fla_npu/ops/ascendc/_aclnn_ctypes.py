@@ -21,6 +21,7 @@ from __future__ import annotations
 import ctypes
 import sys
 
+from ._chunk_scaled_dot_kkt_contract import validate as _validate_chunk_scaled_dot_kkt
 from ._kda_policy import (
     kda_fwd_optional_output_mask,
     _select_kda_bwd_optimized,
@@ -686,7 +687,7 @@ def npu_chunk_gated_delta_rule_bwd_dhu(
     N = len(cu_seqlens) - 1 if cu_seqlens is not None else B
     state_v_first = _optional_bool(transpose_state_layout, False)
     state_tail = (V, K) if state_v_first else (K, V)
-    dh = _empty((B, Hv, NT, K, V), q)
+    dh = _empty((B, NT, Hv, K, V), q)
     dh0_shape = (N, Hv, *state_tail)
     dh0 = _empty(dh0_shape, q) if h0 is not None else None
     dv2 = _empty_like(dv)
@@ -966,7 +967,10 @@ def npu_chunk_gated_delta_rule_fwd_prepare(
     output_a = _optional_bool(output_a, True)
 
     if use_gate_in_kernel:
-        raise ValueError("use_gate_in_kernel currently only supports False.")
+        if a_log is None:
+            raise ValueError("a_log is required when use_gate_in_kernel=True.")
+    elif a_log is not None or dt_bias is not None:
+        raise ValueError("a_log and dt_bias require use_gate_in_kernel=True.")
     if allow_neg_eigval and not use_beta_sigmoid_in_kernel:
         raise ValueError("allow_neg_eigval=True requires use_beta_sigmoid_in_kernel=True.")
     if a_log is not None and _shape(a_log) != (HV,):
@@ -1479,7 +1483,7 @@ def npu_chunk_gated_delta_rule_fwd_h(
         raise RuntimeError(
             "npu_chunk_gated_delta_rule_fwd_h: initial_state shape does not match state_v_first."
         )
-    h_out = _empty((B, HV, NT, *state_tail), k)
+    h_out = _empty((B, NT, HV, *state_tail), k)
     v_new_out = _empty_like(u)
     if output_final_state:
         if initial_state is not None:
@@ -1623,7 +1627,7 @@ def npu_chunk_fwd_h(
         if initial_state.dtype not in {torch.bfloat16, torch.float32}:
             raise RuntimeError(f"{op_name}: initial_state must use bfloat16 or float32.")
 
-    h_out = _empty((batch, v_heads, total_chunks, *state_tail), k)
+    h_out = _empty((batch, total_chunks, v_heads, *state_tail), k)
     v_new_out = _empty(_shape(u), u)
     if output_final_state:
         state_template = initial_state if initial_state is not None else k
@@ -1754,8 +1758,9 @@ def npu_chunk_kda_fwd_finalize(
     if indices is not None and indices != canonical_indices:
         raise RuntimeError(f"{op_name}: chunk_indices must be canonical sequence-major pairs.")
     total_chunks = _chunk_fwd_h_total_chunks(seqlen, 64, cu, indices)
-    if _shape(h) != (batch, heads, total_chunks, 128, 128):
-        raise RuntimeError(f"{op_name}: h must be [B, HV, total_chunks, 128, 128].")
+    h_shape = (batch, total_chunks, heads, 128, 128)
+    if _shape(h) != h_shape:
+        raise RuntimeError(f"{op_name}: h must have NT-first shape {h_shape}.")
 
     out_shape = {
         "BSND": (batch, seqlen, heads, 128),
@@ -2118,22 +2123,29 @@ def npu_chunk_scaled_dot_kkt(
 ):
     import torch
 
+    B, Hv, T = _validate_chunk_scaled_dot_kkt(k, g, beta, cu_seqlens, chunk_indices, chunk_size)
     k_contig = k.contiguous()
     g_contig = g.contiguous()
     beta_contig = beta.contiguous()
-    B, _, T, _ = _shape(k_contig)
-    _, Hv, _ = _shape(g_contig)
     out = _empty((B, Hv, T, int(chunk_size)), k_contig, dtype=torch.float32)
+
+    def nd_tensor(ctx, tensor, name):
+        return ctx.tensor(
+            tensor, name,
+            acl_format_override=ACL_FORMAT_ND,
+            storage_shape_override=_shape(tensor),
+        )
+
     return _call_aclnn(
         "aclnnChunkScaledDotKkt",
         lambda ctx: [
-            ctx.tensor(k_contig, "k"),
-            ctx.tensor(g_contig, "g"),
-            ctx.tensor(beta_contig, "beta"),
+            nd_tensor(ctx, k_contig, "k"),
+            nd_tensor(ctx, g_contig, "g"),
+            nd_tensor(ctx, beta_contig, "beta"),
             ctx.int_array(cu_seqlens),
             ctx.int_array(chunk_indices),
             ctypes.c_int64(int(chunk_size)),
-            ctx.tensor(out, "out"),
+            nd_tensor(ctx, out, "out"),
         ],
         out,
     )
@@ -2906,7 +2918,7 @@ def npu_chunk_gated_delta_rule_fwd(
             else (tokens + chunk_size - 1) // chunk_size
         )
         state_tail = (v_dim, k_dim) if state_v_first else (k_dim, v_dim)
-        h = _empty((batch, v_heads, chunks, *state_tail), q)
+        h = _empty((batch, chunks, v_heads, *state_tail), q)
     layout_buffer = ctypes.create_string_buffer(layout.encode("utf-8"))
     # Hats alias the original inputs when normalization is disabled.
     q_hat = _empty(q_shape, q) if use_qk_l2norm_in_kernel else q
