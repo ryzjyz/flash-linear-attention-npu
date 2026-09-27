@@ -45,7 +45,7 @@ __aicore__ inline void RunFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_AD
                                GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState, GM_ADDR tiling,
                                GM_ADDR userWorkspace,
                                const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
-                               GM_ADDR hoReadyAddr = nullptr)
+                               GM_ADDR hoReadyAddr = nullptr, bool inputSequenceMajor = false)
 {
     // Keep the same H implementation mode as the established FwdHO kernel.
     // The final boolean enables the H/O fused scheduling path; using the
@@ -59,6 +59,7 @@ __aicore__ inline void RunFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, GM_AD
         // 统一入口在 Init 后、Process 前配置；关闭态在 kernel 内部直接返回。
         kernel.ConfigureIdlePipeline(*idleConfig, hoReadyAddr);
     }
+    kernel.ConfigureInputLayout(inputSequenceMajor);
     kernel.Process();
 }
 
@@ -68,7 +69,7 @@ __aicore__ inline void DispatchFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, 
                                     GM_ADDR h, GM_ADDR vNew, GM_ADDR finalState, GM_ADDR tiling,
                                     GM_ADDR userWorkspace,
                                     const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
-                                    GM_ADDR hoReadyAddr = nullptr)
+                                    GM_ADDR hoReadyAddr = nullptr, bool inputSequenceMajor = false)
 {
     const __gm__ GdnMegaArch22FwdHTilingData *hTiling =
         reinterpret_cast<const __gm__ GdnMegaArch22FwdHTilingData *>(tiling);
@@ -79,20 +80,20 @@ __aicore__ inline void DispatchFwdH(GM_ADDR k, GM_ADDR w, GM_ADDR u, GM_ADDR g, 
         if (hTiling->useGk) {
             RunFwdH<InputT, float, float, TileShapes, true>(
                 k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
-                tiling, userWorkspace, idleConfig, hoReadyAddr);
+                tiling, userWorkspace, idleConfig, hoReadyAddr, inputSequenceMajor);
         } else {
             RunFwdH<InputT, float, float, TileShapes, false>(
                 k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
-                tiling, userWorkspace, idleConfig, hoReadyAddr);
+                tiling, userWorkspace, idleConfig, hoReadyAddr, inputSequenceMajor);
         }
     } else if (hTiling->useGk) {
         RunFwdH<InputT, float, InputT, TileShapes, true>(
             k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
-            tiling, userWorkspace, idleConfig, hoReadyAddr);
+            tiling, userWorkspace, idleConfig, hoReadyAddr, inputSequenceMajor);
     } else {
         RunFwdH<InputT, float, InputT, TileShapes, false>(
             k, w, u, g, gk, initialState, cuSeqlens, chunkIndices, h, vNew, finalState,
-            tiling, userWorkspace, idleConfig, hoReadyAddr);
+            tiling, userWorkspace, idleConfig, hoReadyAddr, inputSequenceMajor);
     }
 }
 
@@ -233,7 +234,7 @@ __aicore__ inline void RunFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM
                                GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
                                GM_ADDR userWorkspace, const GdnMegaArch22FwdOTilingData *tiling,
                                const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
-                               GM_ADDR hoReadyAddr = nullptr)
+                               GM_ADDR hoReadyAddr = nullptr, bool inputSequenceMajor = false, bool outputSequenceMajor = false)
 {
     using Kernel = Catlass::Gemm::Kernel::GDNFwdOKernel<InputT, GT, float, true>;
     Kernel kernel;
@@ -241,6 +242,8 @@ __aicore__ inline void RunFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR h, GM
     if (idleConfig != nullptr) {
         kernel.ConfigureIdlePipeline(*idleConfig, hoReadyAddr);
     }
+    kernel.ConfigureInputLayout(inputSequenceMajor);
+    kernel.ConfigureOutputLayout(outputSequenceMajor);
     kernel.Process();
 }
 
@@ -250,7 +253,7 @@ __aicore__ inline void RunRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
     const GdnMegaArch22RecomputeWUTilingData *tiling,
-    const GDN::RecomputeTaskRange *taskRange = nullptr)
+    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false)
 {
     if ASCEND_IS_AIC {
         RecomputeWUFwdProcess<kType, betaType, typename TileShapes::L1TileShape,
@@ -264,6 +267,7 @@ __aicore__ inline void RunRecompute(
         RecomputeWUFwdVectorProcess<kType, betaType, true, kAbcTaskOrder> process(
             k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace);
         process.Init(*tiling, &pipe);
+        process.ConfigureInputLayout(inputSequenceMajor);
         process.Process(taskRange);
     }
 }
@@ -273,16 +277,16 @@ __aicore__ inline void DispatchRecompute(
     GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR A, GM_ADDR g, GM_ADDR cuSeqlens,
     GM_ADDR chunkIndices, GM_ADDR w, GM_ADDR u, GM_ADDR workspace,
     const GdnMegaArch22RecomputeWUTilingData *tiling,
-    const GDN::RecomputeTaskRange *taskRange = nullptr)
+    const GDN::RecomputeTaskRange *taskRange = nullptr, bool inputSequenceMajor = false)
 {
     if constexpr (VDim == 256) {
         RunRecompute<kType, betaType, VDim,
                      GDN::RecomputeWUFwdTileShapes256<kType, betaType>, kAbcTaskOrder>(
-            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange);
+            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange, inputSequenceMajor);
     } else {
         RunRecompute<kType, betaType, VDim,
                      GDN::RecomputeWUFwdTileShapes128<kType, betaType>, kAbcTaskOrder>(
-            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange);
+            k, v, beta, A, g, cuSeqlens, chunkIndices, w, u, workspace, tiling, taskRange, inputSequenceMajor);
     }
 }
 
@@ -291,10 +295,10 @@ __aicore__ inline void DispatchFwdO(GM_ADDR q, GM_ADDR k, GM_ADDR vNew, GM_ADDR 
                                     GM_ADDR cuSeqlens, GM_ADDR chunkIndices, GM_ADDR o,
                                     GM_ADDR userWorkspace, const GdnMegaArch22FwdOTilingData *tiling,
                                     const GdnHoPipeline::HoPipelineConfig *idleConfig = nullptr,
-                                    GM_ADDR hoReadyAddr = nullptr)
+                                    GM_ADDR hoReadyAddr = nullptr, bool inputSequenceMajor = false, bool outputSequenceMajor = false)
 {
     RunFwdO<InputT, float>(q, k, vNew, h, g, cuSeqlens, chunkIndices, o, userWorkspace, tiling,
-                           idleConfig, hoReadyAddr);
+                           idleConfig, hoReadyAddr, inputSequenceMajor, outputSequenceMajor);
 }
 
 #ifndef GDN_CHUNK_RECOMPUTE_WU_FWD_HO_IMPL_ONLY

@@ -33,6 +33,7 @@ constexpr size_t ATTR_OUTPUT_FINAL_STATE = 0;
 constexpr size_t ATTR_CHUNK_SIZE = 1;
 constexpr size_t ATTR_SCALE = 2;
 constexpr size_t ATTR_RAW_G_LAYOUT = 4;
+constexpr size_t ATTR_QKV_LAYOUT = 5;
 
 constexpr int64_t DIM_BATCH = 0;
 constexpr int64_t DIM_HEAD = 1;
@@ -151,9 +152,28 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
                 OP_LOGE(context->GetNodeName(), "cu_seqlens and chunk_indices must be rank 1."),
                 return ge::GRAPH_FAILED);
 
-    const gert::Shape qShape = qShapePtr->GetStorageShape();
-    const gert::Shape kShape = kShapePtr->GetStorageShape();
-    const gert::Shape vShape = vShapePtr->GetStorageShape();
+    const auto *attrs = context->GetAttrs();
+    OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
+    const int64_t *qkvLayoutAttr = attrs->GetAttrPointer<int64_t>(ATTR_QKV_LAYOUT);
+    const int64_t qkvLayout = qkvLayoutAttr == nullptr ? 0 : *qkvLayoutAttr;
+    OP_CHECK_IF(qkvLayout != 0 && qkvLayout != 1,
+                OP_LOGE(context->GetNodeName(), "qkv_layout must be 0 or 1."), return ge::GRAPH_FAILED);
+    auto LogicalQkvShape = [qkvLayout](const gert::StorageShape *input) {
+        gert::StorageShape logical = *input;
+        if (qkvLayout == 1) {
+            auto &shape = logical.MutableStorageShape();
+            const int64_t tokens = shape.GetDim(1);
+            shape.SetDim(1, shape.GetDim(2));
+            shape.SetDim(2, tokens);
+        }
+        return logical;
+    };
+    const auto logicalQ = LogicalQkvShape(qShapePtr);
+    const auto logicalK = LogicalQkvShape(kShapePtr);
+    const auto logicalV = LogicalQkvShape(vShapePtr);
+    const gert::Shape qShape = logicalQ.GetStorageShape();
+    const gert::Shape kShape = logicalK.GetStorageShape();
+    const gert::Shape vShape = logicalV.GetStorageShape();
     const gert::Shape betaShape = betaShapePtr->GetStorageShape();
     const gert::Shape aShape = aShapePtr->GetStorageShape();
     const gert::Shape gShape = gShapePtr->GetStorageShape();
@@ -163,8 +183,6 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
     const int64_t kHeadDim = qShape.GetDim(DIM_CHANNEL);
     const int64_t vNumHead = vShape.GetDim(DIM_HEAD);
     const int64_t vHeadDim = vShape.GetDim(DIM_CHANNEL);
-    const auto *attrs = context->GetAttrs();
-    OP_CHECK_NULL_WITH_CONTEXT(context, attrs);
     const int64_t *rawGLayoutAttr = attrs->GetAttrPointer<int64_t>(ATTR_RAW_G_LAYOUT);
     const int64_t rawGLayout = rawGLayoutAttr == nullptr ? 0 : *rawGLayoutAttr;
     OP_CHECK_IF(rawGLayout != 0 && rawGLayout != 1,
@@ -262,8 +280,8 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22StateOutput(gert::TilingConte
     GDN::GdnMegaArch22RecomputeWUTilingData recomputeTiling{};
     GdnArch22RecomputeWUFwdTilingContext recomputeContext{
         context->GetNodeName(),
-        context->GetRequiredInputShape(INPUT_K),
-        context->GetRequiredInputShape(INPUT_V),
+        &logicalK,
+        &logicalV,
         context->GetRequiredInputShape(INPUT_BETA),
         context->GetRequiredInputShape(INPUT_A),
         context->GetRequiredInputShape(INPUT_G),

@@ -157,7 +157,7 @@ public:
                     const int64_t kBase = ((chunkInfo.bIdx * HK_ + hq) * T_ + chunkInfo.tokenStart) * K_;
                     const int64_t dOBase = ((chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart) * V_;
                     const int64_t dhBase =
-                        ((chunkInfo.bIdx * HV_ + hv) * totalChunkNum_ + chunkInfo.outputChunkIdx) * K_ * V_;
+                        ((chunkInfo.bIdx * totalChunkNum_ + chunkInfo.outputChunkIdx) * HV_ + hv) * K_ * V_;
                     const int64_t slotBase = WorkspaceBase(blockIdx, workspaceSlot);
 
                     LayoutTagK tagK = LayoutTagK::MakeLayout<DT>(chunkSize_, K_);
@@ -178,10 +178,15 @@ public:
                     AscendC::GlobalTensor<DT> gmDO;
                     AscendC::GlobalTensor<DT> gmTermQ;
                     gmK.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(k_) + kBase);
+                    // K 为一次性流式读（组内复用走 L1 kResident，与 L2 无关），
+                    // 禁 L2 防止无收益的写分配驱逐 dh/dv2 生产者-消费者行（fwd_o 先例）
+                    gmK.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
                     gmState.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(dh_) + dhBase);
                     gmDvState.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(workspace_) + slotBase +
                                               dvStateWorkspaceOffset_);
                     gmDO.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(dO_) + dOBase);
+                    // dO 同为一次性流式读，禁 L2（见 gmK 注释）
+                    gmDO.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
                     gmTermQ.SetGlobalBuffer(reinterpret_cast<__gm__ DT *>(workspace_) + slotBase +
                                             termQWorkspaceOffset_);
 
@@ -306,7 +311,9 @@ public:
                         tla::MakeTensor(doL1Tensor, L1B_LAYOUT_DO, Catlass::Arch::PositionL1{});
 
                     // C2a：loop1 头只 gate dh（GM→L1B，:252 与 dvState GEMM），改等 flag3(dhReady)；
-                    // qg 的就绪等待移到 termQ GEMM 前（见下方 flag2 wait）
+                    // qg 的就绪等待移到 termQ GEMM 前（见下方 flag2 wait）。
+                    // （上游 W^T 提前装载不取：其 wResident/WResidentEvent 符号体系已被
+                    //  S2 KW_AGG 聚合退役，MTE2 窗口填充由 KW_AGG 组聚合覆盖。）
                     Catlass::Arch::CrossCoreWaitFlag(vecToCubeDhFlag_);
 
                     auto tensorState = tla::MakeTensor(gmState, layoutState, Catlass::Arch::PositionGM{});
@@ -334,12 +341,16 @@ public:
                         const bool useGmDvState = V_DIM == 256 && chunkInfo.chunkLen > 64;
                         if (useGmDvState) {
                             CopyL0CToGm_DvState<decltype(blockDvState)> copyL0CToGm_DvState;
+                            // 由 RunResidentMmad epilogue 在 L0C→GM 写前发射（同 PIPE_FIX 保序），
+                            // 替代原先调用后的显式 set
+                            earlyNotifyStage_ = true;
                             RunResidentMmad<LayoutTagL0A_DvState, LayoutTagL0B_DvState>(
                                 copyL1ToL0A_DvState, copyL1ToL0B_DvState, tileMmadDvState, copyL0CToGm_DvState,
                                 tensorL1K, tensorL1State, blockDvState, l0A, l0B, l0C,
                                 waitKReady, releaseKAfterUse, kResidentEvent, true, true, stateScratchEvent,
                                 static_cast<uint32_t>(chunkInfo.chunkLen), static_cast<uint32_t>(V_DIM),
                                 static_cast<uint32_t>(K_));
+                            earlyNotifyStage_ = false;
                         } else {
                             uint32_t mActual = static_cast<uint32_t>(chunkInfo.chunkLen);
                             if (mActual == 1) {
@@ -414,6 +425,11 @@ public:
                             }
 
                             SwitchL0C();
+                            // early-notify：set 提前到 Mmad 排空
+                            // 等待与 CV 推送循环之前——AIV 在 GEMM0 尾部即被放行进入
+                            // S1，dvState 逐 tile 可见性仍由 mode-4 ready 保证，
+                            // coarse gate 只负责放行。
+                            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
                             AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEvent);
                             // C5b：dvState CV 片逐片目标子块由 CvTargetSubBlock（limit=chunkLen，劈分头按
                             // DhuSplitHalf 16 对齐半界）判定，cvRows 在半界处截断（片不跨界，如 64 行单片→2×32）；
@@ -459,12 +475,15 @@ public:
                         }
                     } else {
                         CopyL0CToGm_DvState<decltype(blockDvState)> copyL0CToGm_DvState;
+                        // 非 bf16 GM 分支的 early-notify
+                        earlyNotifyStage_ = true;
                         RunResidentMmad<LayoutTagL0A_DvState, LayoutTagL0B_DvState>(
                             copyL1ToL0A_DvState, copyL1ToL0B_DvState, tileMmadDvState, copyL0CToGm_DvState,
                             tensorL1K, tensorL1State, blockDvState, l0A, l0B, l0C,
                             waitKReady, releaseKAfterUse, kResidentEvent, true, true, stateScratchEvent,
                             static_cast<uint32_t>(chunkInfo.chunkLen), static_cast<uint32_t>(V_DIM),
                             static_cast<uint32_t>(K_));
+                        earlyNotifyStage_ = false;
                     }
 
                     auto tensorTermQ = tla::MakeTensor(gmTermQ, layoutTermQ, Catlass::Arch::PositionGM{});
@@ -493,20 +512,12 @@ public:
                         false, false, 0, waitDoReady, releaseDoAfter, doL1BEvent,
                         static_cast<uint32_t>(K_), static_cast<uint32_t>(V_DIM),
                         static_cast<uint32_t>(chunkInfo.chunkLen));
-
-                    // C2-b：loop1 末 flag4 set 仅 GM-dvState 路径执行（与 vector phase2 头 wait 共用
-                    // IsGmDvStatePath 逐 chunk 推导）；CV 路径 phase2 不读 loop1 GM 产物，set 省略。
-                    // loop2 的 flag4 set（GM/CV/fp16 三分支）无条件保留——phase3 的 termQ 就绪由
-                    // loop2 的 PIPE_FIX set 传递覆盖（FIX 管保序，CV 分支 set 位于 termW CV 流之前）
-                    if (IsGmDvStatePath<DT>(V_DIM, chunkInfo.chunkLen)) {
-                        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
-                    }
                 }
                 for (int64_t headOffset = 0; headOffset < headCnt; ++headOffset) {
                     const int64_t hv = hvBase + headOffset;
                     const int64_t workspaceSlot = windowStartSlot + headOffset;
-                    const int64_t wBase = ((chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart) * K_;
                     const int64_t dv2Base = ((chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart) * V_;
+                    const int64_t wBase = ((chunkInfo.bIdx * HV_ + hv) * T_ + chunkInfo.tokenStart) * K_;
                     const int64_t slotBase = WorkspaceBase(blockIdx, workspaceSlot);
                     bool waitWReady = headOffset == 0;
                     const bool releaseWAfterUse = headOffset + 1 == headCnt;
@@ -528,11 +539,11 @@ public:
                                             termWWorkspaceOffset_);
 
                     auto tensorWT = tla::MakeTensor(gmWT, layoutWT, Catlass::Arch::PositionGM{});
-                    auto tensorDv2 = tla::MakeTensor(gmDv2, layoutDv2, Catlass::Arch::PositionGM{});
-                    auto tensorTermW = tla::MakeTensor(gmTermW, layoutTermW, Catlass::Arch::PositionGM{});
                     auto blockWT = tla::GetTile(
                         tensorWT, tla::MakeCoord(0, 0),
                         tla::MakeShape(static_cast<uint32_t>(K_), static_cast<uint32_t>(chunkInfo.chunkLen)));
+                    auto tensorDv2 = tla::MakeTensor(gmDv2, layoutDv2, Catlass::Arch::PositionGM{});
+                    auto tensorTermW = tla::MakeTensor(gmTermW, layoutTermW, Catlass::Arch::PositionGM{});
                     auto blockDv2 = tla::GetTile(
                         tensorDv2, tla::MakeCoord(0, 0),
                         tla::MakeShape(static_cast<uint32_t>(chunkInfo.chunkLen), static_cast<uint32_t>(V_DIM)));
@@ -577,13 +588,15 @@ public:
                         const bool useGmTermW = V_DIM == 256 && chunkInfo.chunkLen > 64;
                         if (useGmTermW) {
                             CopyL0CToGm_TermW<decltype(blockTermW)> copyL0CToGm_TermW;
+                            // epilogue 内 L0C→GM 写前发射
+                            earlyNotifyStage_ = true;
                             RunResidentMmad<LayoutTagL0A_TermW, LayoutTagL0B_TermW>(
                                 copyL1ToL0A_TermW, copyL1ToL0B_TermW, tileMmadTermW, copyL0CToGm_TermW,
                                 tensorL1WT, tensorL1Dv2, blockTermW, l0A, l0B, l0C,
                                 waitWReady, releaseWAfterUse, wEvent, true, true, dv2ScratchEvent,
                                 static_cast<uint32_t>(K_), static_cast<uint32_t>(V_DIM),
                                 static_cast<uint32_t>(chunkInfo.chunkLen));
-                            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
+                            earlyNotifyStage_ = false;
                         } else {
                             const uint32_t l0CSlot = curL0C_;
                             const int32_t l0CEvent = L0CEvent(l0CSlot);
@@ -696,13 +709,15 @@ public:
                         }
                     } else {
                         CopyL0CToGm_TermW<decltype(blockTermW)> copyL0CToGm_TermW;
+                        // 非 bf16 GM 分支的 early-notify
+                        earlyNotifyStage_ = true;
                         RunResidentMmad<LayoutTagL0A_TermW, LayoutTagL0B_TermW>(
                             copyL1ToL0A_TermW, copyL1ToL0B_TermW, tileMmadTermW, copyL0CToGm_TermW,
                             tensorL1WT, tensorL1Dv2, blockTermW, l0A, l0B, l0C,
                             waitWReady, releaseWAfterUse, wEvent, true, true, dv2ScratchEvent,
                             static_cast<uint32_t>(K_), static_cast<uint32_t>(V_DIM),
                             static_cast<uint32_t>(chunkInfo.chunkLen));
-                        Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
+                        earlyNotifyStage_ = false;
                     }
                 }
             }
@@ -1025,6 +1040,14 @@ private:
         SwitchL0C();
         AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(l0CEvent);
         copyL0CToGm(tensorBlockC, tensorL0C, 0b11);
+        // GM 回退路径的 early-notify：必须排在 copyL0CToGm 之后（同 PIPE_FIX
+        // 按序执行 → GM 写完成先于 flag 可见）。GM 路径无 per-tile mode-4 保护，
+        // coarse set 即 dvState/termW 的可见性保证——放在 copy 之前会让 AIV
+        // 读到未写入的数据。相比原 "调用返回后再 set"，此处 set 已进入 FIX 指令流
+        // 免标量线程后续路径。
+        if (earlyNotifyStage_) {
+            Catlass::Arch::CrossCoreSetFlag<0x2, PIPE_FIX>(cubeToVecFlag_);
+        }
         AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CEvent);
     }
 
@@ -1039,6 +1062,9 @@ private:
     Catlass::Arch::CrossCoreFlag vecToCubeFlag_{VEC_TO_CUBE_FLAG_READY};
     Catlass::Arch::CrossCoreFlag vecToCubeDhFlag_{VEC_TO_CUBE_DH_FLAG_READY};
     Catlass::Arch::CrossCoreFlag cubeToVecFlag_{CUBE_TO_VEC_FLAG_READY};
+    // RunResidentMmad epilogue 是否发射 cubeToVec early-notify（GM 回退分支专用；
+    // AIC 标量单线程，调用前设置、模板内消费，无需原子性考虑）
+    bool earlyNotifyStage_ = false;
     const ChunkGatedDeltaRuleBwdDhuTilingData *tiling_ = nullptr;
     int64_t B_ = 0;
     int64_t HK_ = 0;

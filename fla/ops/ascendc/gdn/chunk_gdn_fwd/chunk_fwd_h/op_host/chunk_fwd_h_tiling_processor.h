@@ -50,7 +50,6 @@ struct ChunkFwdHTilingContext {
     // attrs
     bool storeFinalState;
     int64_t chunkSize;
-    bool hChunkMajor;
     // platform
     uint32_t aicCoreNum;
     size_t libApiWorkSpaceSize;
@@ -128,7 +127,6 @@ public:
         tiling.isVariedLen = isVariedLen;
         tiling.shapeBatch = shapeBatch;
         tiling.tokenBatch = tokenBatch;
-        tiling.hChunkMajor = ctx_.hChunkMajor ? 1 : 0;
     }
 
 private:

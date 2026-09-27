@@ -27,21 +27,6 @@
 
 namespace GDN {
 
-// Dhu-C2b：GM-dvState 路径判定（= phase2 需要消费 loop1 的 GM 产物）。
-// vector/cube 两侧必须用本函数对同一 (DT, V, chunkLen) 逐 chunk 推导，保证 cube loop1 末 flag4 set
-// 与 vector phase2 头 flag4 wait 严格配对——两侧条件不一致将信用失衡导致冻核（本项最高危点）。
-// 判定公式与 useGmDvState（cube.h / vector.h 中 V==256 && chunkLen>64）必须保持同一，改动需同步。
-// CV 路径（返回 false）phase2 仅读 dvState CV 片（bank flag 6/7 逐片 gate）与 dv 输入 GM（入口即稳定），
-// 不读任何 loop1 GM 产物，故 loop1 末 flag4 set 与 phase2 头 wait 均可省。
-template <typename DT>
-__aicore__ inline bool IsGmDvStatePath(int64_t v, int64_t chunkLen)
-{
-    if constexpr (std::is_same<DT, bfloat16_t>::value) {
-        return v == 256 && chunkLen > 64;
-    }
-    return true; // fp16：dvState 恒走 GM（cube/vector 的 fp16 分支均读 GM）
-}
-
 // Dhu-C5：劈分头判定（单一共享谓词——vector IsSplitHead / cube CvTargetSubBlock / dvState
 // tokenHalf 三处消费必须同式，R-C5-1 配对纪律）。
 // headCnt>1 门控（C5a 形状矩阵回归修复）：headCnt==1（如 H=8、headsPerTask=1）时劈分在
@@ -81,9 +66,10 @@ __aicore__ inline uint32_t CvTargetSubBlock(int64_t headCnt, int64_t headOffset,
 }
 
 constexpr uint64_t VEC_TO_CUBE_FLAG_READY = 2;
-// Dhu-C2a：dh ready / qg ready 拆分。flag3=dhReady（AIV 在 state/dh K 行循环结束即 set），
-// flag2 语义收窄为 qgReady（AIV 在 qg staging 完成后 set）。ID 3 不与 {0,1,6,7} 的 CV 通道及
-// {8,9,10} 的 catlass barrier 撞号；每 chunk set/wait 各 3 对 3（AND 配对），远小于 15 次上限。
+// Dhu-C2a/C3 汇合（双方同选 flagId 3）：dh ready / qg ready 拆分。flag3=dhReady（AIV 在
+// state/dh K 行循环结束即 set），flag2 语义收窄为 qgReady（AIV 在 qg staging 完成后 set）。
+// ID 3 不与 {0,1,6,7} 的 CV 通道及 {8,9,10} 的 catlass barrier 撞号；每 chunk set/wait
+// 各 3 对 3（AND 配对），远小于 15 次上限。
 constexpr uint64_t VEC_TO_CUBE_DH_FLAG_READY = 3;
 constexpr uint64_t CUBE_TO_VEC_FLAG_READY = 4;
 constexpr uint32_t CV_BUFFER_COUNT = 2;

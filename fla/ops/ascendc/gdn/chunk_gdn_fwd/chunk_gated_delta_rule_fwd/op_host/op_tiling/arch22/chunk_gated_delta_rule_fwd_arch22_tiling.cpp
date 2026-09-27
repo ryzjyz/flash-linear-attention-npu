@@ -39,6 +39,8 @@ constexpr size_t ATTR_OUTPUT_FINAL_STATE = 0;
 constexpr size_t ATTR_CHUNK_SIZE = 1;
 constexpr size_t ATTR_OUTPUT_G_CUMSUM = 3;
 constexpr size_t ATTR_RAW_G_LAYOUT = 4;
+constexpr size_t ATTR_QKV_LAYOUT = 5;
+constexpr size_t ATTR_O_LAYOUT = 6;
 
 constexpr int64_t SUPPORTED_K_DIM = 128;
 constexpr int64_t SUPPORTED_V_DIM_128 = 128;
@@ -206,13 +208,31 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
     OP_CHECK_IF(rawGLayout != 0 && rawGLayout != 1,
                 OP_LOGE(context->GetNodeName(), "raw_g_layout must be 0 (BHT) or 1 (BTH)."),
                 return ge::GRAPH_FAILED);
+    const int64_t *qkvLayoutAttr = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_QKV_LAYOUT);
+    const int64_t qkvLayout = qkvLayoutAttr == nullptr ? 0 : *qkvLayoutAttr;
+    OP_CHECK_IF(qkvLayout != 0 && qkvLayout != 1,
+                OP_LOGE(context->GetNodeName(), "qkv_layout must be 0 (BHTD) or 1 (BTHD)."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(qkvLayout == 1 && platform.GetCurNpuArch() != NpuArch::DAV_2201,
+                OP_LOGE(context->GetNodeName(), "Native token-major QKV requires DAV_2201."),
+                return ge::GRAPH_FAILED);
+    const int64_t *oLayoutAttr = context->GetAttrs()->GetAttrPointer<int64_t>(ATTR_O_LAYOUT);
+    const int64_t oLayout = oLayoutAttr == nullptr ? 0 : *oLayoutAttr;
+    OP_CHECK_IF(oLayout != 0 && oLayout != 1,
+                OP_LOGE(context->GetNodeName(), "o_layout must be 0 (BHTV) or 1 (BTHV)."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(oLayout == 1 && platform.GetCurNpuArch() != NpuArch::DAV_2201,
+                OP_LOGE(context->GetNodeName(), "Native token-major O requires DAV_2201."),
+                return ge::GRAPH_FAILED);
+    const size_t headAxis = qkvLayout == 1 ? 2 : 1;
+    const size_t tokenAxis = qkvLayout == 1 ? 1 : 2;
     const gert::Shape qStorage = qShape->GetStorageShape();
     const int64_t batch = qStorage.GetDim(0);
-    const int64_t heads = qStorage.GetDim(1);
-    const int64_t tokens = qStorage.GetDim(2);
+    const int64_t heads = qStorage.GetDim(headAxis);
+    const int64_t tokens = qStorage.GetDim(tokenAxis);
     const int64_t kDim = qStorage.GetDim(3);
     const gert::Shape vStorage = vShape->GetStorageShape();
-    const int64_t valueHeads = vStorage.GetDim(1);
+    const int64_t valueHeads = vStorage.GetDim(headAxis);
     const int64_t vDim = vStorage.GetDim(3);
     const auto *cuShape = context->GetOptionalInputShape(INPUT_CU_SEQLENS);
     const auto *chunkShape = context->GetOptionalInputShape(INPUT_CHUNK_INDICES);
@@ -228,10 +248,12 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
                 OP_LOGE(context->GetNodeName(),
                         "Phase 6 requires positive B/Hk/T, Hk divides Hv, K=128, and V=128/256; dense T may be arbitrary."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(!IsShape(kShape, {batch, heads, tokens, kDim}),
+    OP_CHECK_IF(!(qkvLayout == 1 ? IsShape(kShape, {batch, tokens, heads, kDim}) :
+                                      IsShape(kShape, {batch, heads, tokens, kDim})),
                 OP_LOGE(context->GetNodeName(), "Phase 6 requires k to match q in [B,H,T,K]."),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(!IsShape(vShape, {batch, valueHeads, tokens, vDim}),
+    OP_CHECK_IF(!(qkvLayout == 1 ? IsShape(vShape, {batch, tokens, valueHeads, vDim}) :
+                                      IsShape(vShape, {batch, valueHeads, tokens, vDim})),
                 OP_LOGE(context->GetNodeName(), "Phase 6 requires v=[B,Hv,T,V] with Hv divisible by Hk."),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(!IsShape(betaShape, {batch, valueHeads, tokens}),
@@ -345,6 +367,8 @@ ge::graphStatus Tiling4ChunkGatedDeltaRuleFwdArch22(gert::TilingContext *context
 
     GDN::Arch22ChunkGatedDeltaRuleFwdTrailer trailer{};
     auto &abc = trailer.abc;
+    abc.qkvLayout = static_cast<uint64_t>(qkvLayout);
+    abc.oLayout = static_cast<uint64_t>(oLayout);
     abc.B = static_cast<uint64_t>(batch);
     abc.Hk = static_cast<uint64_t>(heads);
     abc.Hv = static_cast<uint64_t>(valueHeads);
