@@ -155,7 +155,7 @@ private:
     using DvCopy = Catlass::Gemm::Tile::PackedTileCopyTla<
         ArchTag, T, ColumnMajor, T, RowMajor, T, RowMajor>;
     using DqCopy = Catlass::Gemm::Tile::PackedTileCopyTla<
-        ArchTag, T, RowMajor, T, ColumnMajor, float, RowMajor>;
+        ArchTag, T, RowMajor, T, ColumnMajor, KdaBwdDqRawStoreT, RowMajor>;
     using DACopy = Catlass::Gemm::Tile::PackedTileCopyTla<
         ArchTag, T, RowMajor, T, ColumnMajor, float, RowMajor>;
 
@@ -776,7 +776,7 @@ private:
     }
 
 #endif
-    template <typename Copy, typename Mmad>
+    template <typename Copy, typename Mmad, typename DstT>
     __aicore__ inline void RunDoLeft(
         GM_ADDR rightBase, uint32_t rightCols,
         GM_ADDR outBase, uint32_t outStride, uint32_t outCols,
@@ -862,10 +862,10 @@ private:
         }
         AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_L0C);
 
-        AscendC::GlobalTensor<float> gmOut;
-        gmOut.SetGlobalBuffer(reinterpret_cast<__gm__ float *>(outBase));
+        AscendC::GlobalTensor<DstT> gmOut;
+        gmOut.SetGlobalBuffer(reinterpret_cast<__gm__ DstT *>(outBase));
         auto outTensor = tla::MakeTensor(
-            gmOut, tla::MakeLayout<float, RowMajor>(
+            gmOut, tla::MakeLayout<DstT, RowMajor>(
                        KDA_BWD_A_C, outStride),
             Catlass::Arch::PositionGM{});
         auto blockOut = GetTile(
@@ -999,10 +999,10 @@ private:
 
         const uint64_t dqOffset = KdaBwdAHeadTokenOffset(
             tiling_, task, head, KDA_BWD_A_K);
-        AscendC::GlobalTensor<float> dqGm;
+        AscendC::GlobalTensor<KdaBwdDqRawStoreT> dqGm;
         AscendC::GlobalTensor<float> dAGm;
         dqGm.SetGlobalBuffer(
-            reinterpret_cast<__gm__ float *>(dqRaw_) + dqOffset);
+            reinterpret_cast<__gm__ KdaBwdDqRawStoreT *>(dqRaw_) + dqOffset);
         // This tensor is a view into the fused operator workspace rather than
         // an aclTensor argument.  Publish its logical extent so device-side
         // bounds checking can validate the FixPipe store correctly.
@@ -1010,7 +1010,7 @@ private:
             reinterpret_cast<__gm__ float *>(dARawSlot),
             static_cast<uint64_t>(KDA_BWD_A_C) * KDA_BWD_A_C);
         auto dqTensor = tla::MakeTensor(
-            dqGm, tla::MakeLayout<float, RowMajor>(
+            dqGm, tla::MakeLayout<KdaBwdDqRawStoreT, RowMajor>(
                       KDA_BWD_A_C, KDA_BWD_A_K),
             Catlass::Arch::PositionGM{});
         auto dATensor = tla::MakeTensor(
@@ -1039,12 +1039,12 @@ private:
             tiling_, task, taskIdx, head, KDA_BWD_A_K * V_DIM);
         const uint64_t outOffset =
             KdaBwdAHeadTokenOffset(tiling_, task, head, KDA_BWD_A_K);
-        RunDoLeft<DqCopy, DqMmad>(
+        RunDoLeft<DqCopy, DqMmad, KdaBwdDqRawStoreT>(
             reinterpret_cast<GM_ADDR>(
                 reinterpret_cast<__gm__ T *>(h_) + hOffset),
             KDA_BWD_A_K,
             reinterpret_cast<GM_ADDR>(
-                reinterpret_cast<__gm__ float *>(dqRaw_) + outOffset),
+                reinterpret_cast<__gm__ KdaBwdDqRawStoreT *>(dqRaw_) + outOffset),
             KDA_BWD_A_K, KDA_BWD_A_K, task.validC, false);
     }
 
@@ -1057,7 +1057,7 @@ private:
         const uint64_t outOffset =
             KdaBwdAHeadTokenOffset(
                 tiling_, task, head, KDA_BWD_A_C);
-        RunDoLeft<DACopy, DAMmad>(
+        RunDoLeft<DACopy, DAMmad, float>(
             reinterpret_cast<GM_ADDR>(
                 reinterpret_cast<__gm__ T *>(vNew_) + vOffset),
             KDA_BWD_A_C,
