@@ -10,9 +10,17 @@
 | q_rstd | None | 前向 Q 归一化保存的 FP32 标准差倒数 |
 | k_rstd | None | 前向 K 归一化保存的 FP32 标准差倒数 |
 
-普通保存中间量调用仍走原路径。auto 在传入完整 rstd 对或
-`disable_recompute=False` 时选择 V2；legacy 不接受 rstd。
-不支持的优化配置在启动前报错，运行失败后不自动回退。
+auto 在以下情况选择 V2：传入完整 rstd 对、`disable_recompute=False`，或无 rstd 的
+保存中间量且 V2 支持该调用形态。保存中间量路径跳过 Recompute/FwdH，仅执行
+Prepare→Dhu→Finalize。仅对**无 rstd 的 auto 保存中间量调用**，V2 不支持的形态
+（非 Ascend950、非 BF16、K/V 非 128、非 safe_gate/use_gate_in_kernel/use_exp2、
+state_v_first、initial_state/dht、设备端元数据等）才回退 legacy；auto+rstd 和
+full-recompute 保持严格校验，不在此回退范围。legacy 不接受 rstd。
+显式指定不支持的优化配置在启动前报错，运行失败后不自动回退。
+
+auto 的**无 rstd 保存中间量路径**保持 legacy 的输出类型：dq/dk/db 为 FP32
+（V2 产出后做一次 BF16→FP32 转换），dv 为 BF16。auto+rstd 与显式
+`implementation="optimized"` 仍使用下表的 V2 原生输出类型，不做该转换。
 
 ```python
 from fla_npu.ops.ascendc import chunk_kda_bwd
@@ -31,7 +39,7 @@ BF16 张量；Finalize 已融合归一化反向，调用方不应重复计算。
 
 ## 输入与输出
 
-| 项目 | 优化路径约束 |
+| 项目 | 显式 optimized 路径约束（auto 保存值路径的输出类型见上节） |
 |---|---|
 | 平台与维度 | Ascend950；Hq=Hv，K=V=128，chunk_size=64，B/H/T 为正 |
 | Token 布局 | 连续 dense [B,H,T,D] 或 packed [H,T,D] |

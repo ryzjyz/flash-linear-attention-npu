@@ -1712,7 +1712,7 @@ def _kda_bwd_single_launch(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h,
 
 def _kda_bwd_optimized_launch(args):
     """Share input policy with the reference, but launch V2 through Stable ABI."""
-    from ._kda_policy import _prepare_kda_bwd_optimized
+    from ._kda_policy import _kda_bwd_optimized_legacy_outputs, _prepare_kda_bwd_optimized
 
     bias_shape = None if args["dt_bias"] is None else args["dt_bias"].shape
     a = _prepare_kda_bwd_optimized(args)
@@ -1728,7 +1728,7 @@ def _kda_bwd_optimized_launch(args):
     )
     if bias_shape is not None:
         outputs = (*outputs[:-1], outputs[-1].view(bias_shape))
-    return outputs
+    return _kda_bwd_optimized_legacy_outputs(a, outputs)
 
 
 def npu_chunk_kda_bwd(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
@@ -1765,11 +1765,20 @@ def npu_chunk_kda_bwd(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
     import torch
 
     from ._runtime import optional_bool as _optional_bool
-    from ._kda_policy import _select_kda_bwd_optimized
+    from ._kda_policy import (
+        _kda_bwd_metadata_tuple,
+        _kda_bwd_saved_staged_supported,
+        _select_kda_bwd_optimized,
+    )
 
+    saved_staged = False
+    if implementation == "auto" and q_rstd is None and _optional_bool(disable_recompute, True):
+        cu_seqlens = _kda_bwd_metadata_tuple(cu_seqlens)
+        chunk_indices = _kda_bwd_metadata_tuple(chunk_indices)
+        saved_staged = _kda_bwd_saved_staged_supported(locals())
     if _select_kda_bwd_optimized(
             implementation, q_rstd, k_rstd,
-            _optional_bool(disable_recompute, True)):
+            _optional_bool(disable_recompute, True), saved_staged=saved_staged):
         return _kda_bwd_optimized_launch(locals())
 
     chunk_size = int(chunk_size)
@@ -1860,7 +1869,8 @@ def npu_chunk_kda_bwd(q, k, v, beta, gk, Aqk, Akk, w, qg, kg, v_new, h, d_o,
                 chunk_indices=None, chunk_size=chunk_size, safe_gate=safe_gate,
                 lower_bound=lower_bound,
                 use_gate_in_kernel=use_gate_in_kernel,
-                disable_recompute=True, use_exp2=True, state_v_first=False))
+                disable_recompute=True, use_exp2=True, state_v_first=False,
+                implementation="legacy"))
             chunk_begin += sequence_chunks
 
         # Token gradients are concatenated along the token axis; the scalar

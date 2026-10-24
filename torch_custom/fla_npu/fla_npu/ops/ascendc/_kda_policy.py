@@ -37,7 +37,8 @@ def kda_fwd_optional_output_mask(
     )
 
 
-def _select_kda_bwd_optimized(implementation, q_rstd, k_rstd, disable_recompute):
+def _select_kda_bwd_optimized(implementation, q_rstd, k_rstd, disable_recompute,
+                              saved_staged=False):
     if implementation not in ("auto", "legacy", "optimized"):
         raise ValueError("implementation must be auto, legacy or optimized")
     if (q_rstd is None) != (k_rstd is None):
@@ -46,7 +47,48 @@ def _select_kda_bwd_optimized(implementation, q_rstd, k_rstd, disable_recompute)
         if q_rstd is not None:
             raise ValueError("legacy does not support L2Norm backward")
         return False
-    return implementation == "optimized" or q_rstd is not None or not disable_recompute
+    return (implementation == "optimized" or q_rstd is not None or
+            not disable_recompute or saved_staged)
+
+
+def _kda_bwd_metadata_tuple(value):
+    """Materialize one-shot metadata iterators once, before capability probing."""
+    if value is None or isinstance(value, (list, tuple)) or hasattr(value, "device"):
+        return value
+    return tuple(value)
+
+
+def _kda_bwd_saved_staged_supported(args):
+    """Non-throwing capability probe for the new auto saved staged path."""
+    if args.get("q_rstd") is not None or args.get("disable_recompute", True) is False:
+        return False
+    try:
+        _prepare_kda_bwd_optimized(args)
+    except (ValueError, RuntimeError, TypeError):
+        return False
+    import math
+    lower_bound_arg = args.get("lower_bound")
+    lower_bound = -5.0 if lower_bound_arg is None else float(lower_bound_arg)
+    if not math.isfinite(lower_bound) or lower_bound < -5.0 or lower_bound >= 0.0:
+        return False
+    q = args["q"]
+    packed = args["cu_seqlens"] is not None
+    shape = tuple(q.shape)
+    b, h, t, _ = (1, *shape) if packed else shape
+    return not (h > 0xFFFFFFFF // t or b > 0xFFFFFFFF // (h * t))
+
+
+def _kda_bwd_optimized_legacy_outputs(args, outputs):
+    """Keep the legacy FP32 dq/dk/db contract for the newly staged auto path."""
+    if (args.get("implementation") == "auto" and args.get("q_rstd") is None and
+            args.get("disable_recompute", True) is not False):
+        import torch
+        converted = list(outputs)
+        for index in (0, 1, 3):
+            if converted[index] is not None and converted[index].dtype != torch.float32:
+                converted[index] = converted[index].float()
+        return tuple(converted)
+    return outputs
 
 
 def _canonical_kda_bwd_metadata(cu, indices, total_tokens, chunk_size=64):

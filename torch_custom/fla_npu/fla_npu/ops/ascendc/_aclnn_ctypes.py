@@ -25,6 +25,9 @@ import sys
 from ._chunk_scaled_dot_kkt_contract import validate as _validate_chunk_scaled_dot_kkt
 from ._kda_policy import (
     kda_fwd_optional_output_mask,
+    _kda_bwd_metadata_tuple,
+    _kda_bwd_saved_staged_supported,
+    _kda_bwd_optimized_legacy_outputs,
     _select_kda_bwd_optimized,
     _prepare_kda_bwd_optimized,
 )
@@ -3224,7 +3227,8 @@ def _run_kda_bwd_optimized(args):
             None if dbias is None else dbias.view(h,128)),("dq","dk","dv","db","dg","dh0","dA","dbias"))]
         return values
 
-    return _call_aclnn("aclnnChunkKdaBwdV2",build,outputs)
+    return _kda_bwd_optimized_legacy_outputs(
+        args, _call_aclnn("aclnnChunkKdaBwdV2", build, outputs))
 
 
 def npu_chunk_kda_bwd(
@@ -3273,7 +3277,14 @@ def npu_chunk_kda_bwd(
     """
     import torch
 
-    if _select_kda_bwd_optimized(implementation, q_rstd, k_rstd, _optional_bool(disable_recompute, True)):
+    saved_staged = False
+    if implementation == "auto" and q_rstd is None and _optional_bool(disable_recompute, True):
+        cu_seqlens = _kda_bwd_metadata_tuple(cu_seqlens)
+        chunk_indices = _kda_bwd_metadata_tuple(chunk_indices)
+        saved_staged = _kda_bwd_saved_staged_supported(locals())
+    if _select_kda_bwd_optimized(
+            implementation, q_rstd, k_rstd, _optional_bool(disable_recompute, True),
+            saved_staged=saved_staged):
         return _run_kda_bwd_optimized(locals())
 
     chunk_size = int(chunk_size)
@@ -3439,6 +3450,7 @@ def npu_chunk_kda_bwd(
                 chunk_size=chunk_size, safe_gate=safe_gate,
                 lower_bound=lower_bound, use_gate_in_kernel=use_gate_in_kernel,
                 disable_recompute=True, use_exp2=True, state_v_first=False,
+                implementation="legacy",
             ))
             chunk_begin += sequence_chunks
 
